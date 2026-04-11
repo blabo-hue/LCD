@@ -16,6 +16,8 @@ go to .pio -> libdeps -> TFT_eSPI -> User_Setup.h and edit the following:
 
 #define TFT_MOSI 13
 #define TFT_SCLK 14
+
+
 #define TFT_CS   15  // Chip select control pin
 #define TOUCH_CS 33     // Chip select pin (T_CS) of touch screen
 #define TFT_DC    2  // Data Command control pin
