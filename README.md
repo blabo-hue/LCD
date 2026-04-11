@@ -3,7 +3,7 @@ pair an LCD on the base esp32
 
 for Driver ST7796 Setup:
 
-go to libdeps -> TFT_eSPI -> User_Setup.h and edit the following:
+go to .pio -> libdeps -> TFT_eSPI -> User_Setup.h and edit the following:
 
 
 #define ST7796_DRIVER
