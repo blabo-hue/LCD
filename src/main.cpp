@@ -14,7 +14,9 @@
  */
 
 #include <Arduino.h>
+#include <SPI.h>
 #include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
 #include <esp_now.h>
 #include <WiFi.h>
 
@@ -54,9 +56,28 @@
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Flow rate
-//   100 mL/min  →  1 mL = 600 ms  →  duration_ms = ml × 600
+//   72 mL/min  →  1 mL ≈ 833 ms  →  duration_ms = ml × 833
 // ─────────────────────────────────────────────────────────────────────────────
-#define MS_PER_ML    600UL
+#define MS_PER_ML    833UL
+
+// Force-stop button: GPIO 0 (BOOT button on most ESP32 devkits, active-low)
+#define STOP_BTN_PIN  0
+
+// On-screen FORCE STOP touch button (bottom of display, visible during dispensing)
+#define STOP_BTN_H   56                    // button height in pixels
+#define STOP_BTN_Y   (SCR_H - STOP_BTN_H) // button top Y = 424
+
+// Touch detection threshold: bottom fifth of the 480 px screen = y >= 384.
+// We check BOTH the forward and inverted Y mapping so the hit region is correct
+// regardless of whether this board's XPT2046 Y-axis runs top-to-bottom or bottom-to-top.
+#define TOUCH_BOTTOM_FIFTH  (SCR_H * 4 / 5)   // 384 px
+
+// Raw XPT2046 calibration — adjust if taps feel offset.
+// Tap each corner and print p.x / p.y via Serial to find your exact values.
+#define TS_MINX  300
+#define TS_MAXX 3800
+#define TS_MINY  300
+#define TS_MAXY 3800
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Limits
@@ -88,6 +109,12 @@ struct Dispense {
 TFT_eSPI    tft;
 TFT_eSprite barSpr(&tft);   // 288×14 sprite — ~8 KB, reused for every bar redraw
 
+// Touch controller — uses the default SPI object (VSPI) remapped to the HSPI pins
+// so it shares the same physical wires as TFT_eSPI (which drives HSPI itself).
+// Two SPI peripherals on the same GPIOs is valid on ESP32 as long as their CS
+// pins are separate and only one is asserted at a time.
+static XPT2046_Touchscreen   ts(TOUCH_CS);   // TOUCH_CS=33 from build flags
+
 char         username[32] = "";      // empty = not yet logged in
 DisplayState state        = ST_IDLE;
 Dispense     disp[MAX_DISP];
@@ -96,6 +123,10 @@ int16_t      cardH        = 100;      // recalculated whenever dispN changes
 bool         spriteOk     = false;    // true if barSpr allocated successfully
 
 uint32_t     completeAt   = 0;        // millis() when COMPLETE was received
+
+// Team34 (main controller) MAC — learned dynamically on first ESP-NOW receive
+static uint8_t mainMAC[6]  = {};
+static bool    mainMACKnown = false;
 
 // Layout debounce: batch rapid DISPENSE commands into one screen redraw
 bool         layoutDirty  = false;
@@ -117,6 +148,7 @@ char          recvBuf[251];   // +1 for null terminator (ESP-NOW max payload = 2
 void     parseCmd(const char *s);
 void     drawIdle();
 void     drawDispLayout();
+void     drawStopButton();
 void     updateBars();
 void     drawComplete();
 void     recalcCardH();
@@ -133,13 +165,38 @@ void     gradientFill(int x, int y, int w, int h, uint16_t topC, uint16_t botC);
 // ─────────────────────────────────────────────────────────────────────────────
 #if ESP_IDF_VERSION_MAJOR >= 5
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    const uint8_t *senderMAC = info->src_addr;
 #else
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
+    const uint8_t *senderMAC = mac;
 #endif
+    // Register the main controller as a peer the first time we hear from it,
+    // so we can send STOP commands back.
+    if (!mainMACKnown) {
+        memcpy(mainMAC, senderMAC, 6);
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, mainMAC, 6);
+        peer.channel = 0;
+        peer.encrypt = false;
+        esp_now_add_peer(&peer);
+        mainMACKnown = true;
+        Serial.printf("[INFO] Registered main controller MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      mainMAC[0], mainMAC[1], mainMAC[2], mainMAC[3], mainMAC[4], mainMAC[5]);
+    }
+
     if (len <= 0 || len > 250 || recvFlag) return;  // drop if out of range or buffer busy
     memcpy(recvBuf, data, len);
     recvBuf[len] = '\0';
     recvFlag = true;  // signal loop() to process recvBuf
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Send a command back to the main controller ESP32 via ESP-NOW
+// ─────────────────────────────────────────────────────────────────────────────
+static void sendToMain(const char *msg) {
+    if (!mainMACKnown) { Serial.println("[WARN] Main MAC unknown — STOP not sent"); return; }
+    esp_now_send(mainMAC, (const uint8_t *)msg, strlen(msg));
+    Serial.printf("[MAIN] >> \"%s\"\n", msg);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -167,8 +224,10 @@ void gradientFill(int x, int y, int w, int h, uint16_t topC, uint16_t botC) {
 // Recalculate card height based on current ingredient count
 // ─────────────────────────────────────────────────────────────────────────────
 void recalcCardH() {
-    if (dispN == 0) { cardH = SCR_H - HDR_H; return; }
-    cardH = (SCR_H - HDR_H) / dispN;
+    // Reserve STOP_BTN_H pixels at the bottom for the on-screen force-stop button
+    const int usable = SCR_H - HDR_H - STOP_BTN_H;
+    if (dispN == 0) { cardH = usable; return; }
+    cardH = usable / dispN;
     if (cardH > 140) cardH = 140;
     if (cardH <  60) cardH =  60;
 }
@@ -258,6 +317,21 @@ void drawDispLayout() {
 
     // Force bar redraw on next frame by invalidating cached pct values
     for (int i = 0; i < dispN; i++) disp[i].pct = 0xFF;
+
+    drawStopButton();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// On-screen FORCE STOP button — drawn at bottom of display during dispensing
+// ─────────────────────────────────────────────────────────────────────────────
+void drawStopButton() {
+    const uint16_t C_RED = 0xF800;   // pure red in RGB565
+    tft.fillRoundRect(MARGIN, STOP_BTN_Y + 4, SCR_W - 2 * MARGIN, STOP_BTN_H - 8, 10, C_RED);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(4);   // 26 px
+    tft.setTextColor(C_WHITE, C_RED);
+    tft.drawString("FORCE STOP", SCR_W / 2, STOP_BTN_Y + STOP_BTN_H / 2);
+    tft.setTextDatum(ML_DATUM);   // restore default datum
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -271,7 +345,8 @@ void updateBars() {
         if (!disp[i].active) continue;
 
         // ── Calculate progress fraction ──────────────────────────────────
-        uint32_t elapsed = now - disp[i].startMs;
+        // startMs is set 650 ms in the future, so clamp to 0 during the padding window.
+        uint32_t elapsed = (now >= disp[i].startMs) ? (now - disp[i].startMs) : 0;
         float frac = (disp[i].durMs > 0)
                      ? (float)elapsed / (float)disp[i].durMs
                      : 1.0f;
@@ -428,7 +503,7 @@ void parseCmd(const char *s) {
         strncpy(d.name, p, (size_t)nlen);
         d.name[nlen] = '\0';
         d.ml      = ml;
-        d.startMs = millis();
+        d.startMs = millis() + 650UL;   // 650 ms padding so bar holds at 0% while pump spins up
         d.durMs   = (uint32_t)ml * MS_PER_ML;   // e.g. 50 mL × 600 = 30 000 ms
         d.active  = true;
         d.done    = false;
@@ -462,9 +537,19 @@ void parseCmd(const char *s) {
 void setup() {
     Serial.begin(115200);
 
+    // ── Force-stop button ─────────────────────────────────────────────────────
+    pinMode(STOP_BTN_PIN, INPUT_PULLUP);   // GPIO 0 / BOOT button, active-low
+
     // ── TFT init ─────────────────────────────────────────────────────────────
     tft.init();
     tft.setRotation(0);       // portrait: 320 wide × 480 tall
+
+    // ── Touch init ───────────────────────────────────────────────────────────
+    // Remap default SPI (VSPI) to the same physical pins as TFT_eSPI's HSPI.
+    // CS pins (TFT_CS=15, TOUCH_CS=33) ensure only one device drives the bus.
+    SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
+    ts.begin();
+    ts.setRotation(0);
 
 #ifdef SCREEN_TEST
     // Flashes R/G/B to confirm TFT SPI and backlight are alive.
@@ -566,6 +651,52 @@ void loop() {
 
     uint32_t now = millis();
     static uint32_t lastFrame = 0;
+
+    // ── Force-stop button (GPIO 0, active-low, 50 ms debounce) ──────────────
+    {
+        static bool     btnReading   = HIGH;
+        static bool     btnLast      = HIGH;
+        static uint32_t btnDebounceT = 0;
+
+        bool btnRaw = (bool)digitalRead(STOP_BTN_PIN);
+        if (btnRaw != btnReading) {
+            btnReading   = btnRaw;
+            btnDebounceT = now;
+        }
+        if ((now - btnDebounceT) >= 50 && btnReading != btnLast) {
+            btnLast = btnReading;
+            if (btnLast == LOW && state == ST_DISPENSING) {
+                sendToMain("STOP");
+                parseCmd("COMPLETE");   // show completion screen locally
+                Serial.println("[BTN] Force stop triggered");
+            }
+        }
+    }
+
+    // ── On-screen FORCE STOP touch button (500 ms debounce) ─────────────────
+    // Accept touches only in the bottom fifth of the screen (physical Y >= 384).
+    // XPT2046 raw Y can run either top→bottom (high raw = bottom) or bottom→top
+    // (low raw = bottom) depending on the board.  We cover both cases by checking
+    // whether the raw Y is in the HIGH fifth OR the LOW fifth of the 300–3800 range.
+    //   High fifth threshold = TS_MINY + (TS_MAXX-TS_MINY)*4/5 = 2540
+    //   Low  fifth threshold = TS_MINY + (TS_MAXY-TS_MINY)*1/5 = 1000
+    {
+        static uint32_t touchDebounce = 0;
+        if (state == ST_DISPENSING && (now - touchDebounce) > 500 && ts.touched()) {
+            TS_Point p = ts.getPoint();
+            const int yRange    = TS_MAXY - TS_MINY;
+            const int yHigh     = TS_MINY + yRange * 4 / 5;   // 2540
+            const int yLow      = TS_MINY + yRange * 1 / 5;   // 1060
+            Serial.printf("[TOUCH] raw=(%d,%d)  yHigh=%d  yLow=%d\n",
+                          p.x, p.y, yHigh, yLow);
+            if (p.y >= yHigh || p.y <= yLow) {
+                touchDebounce = now;
+                sendToMain("STOP");
+                parseCmd("COMPLETE");
+                Serial.println("[TOUCH] Force stop triggered");
+            }
+        }
+    }
 
     switch (state) {
 
