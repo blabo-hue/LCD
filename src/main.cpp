@@ -124,6 +124,8 @@ bool         spriteOk     = false;    // true if barSpr allocated successfully
 
 uint32_t     completeAt   = 0;        // millis() when COMPLETE was received
 
+
+
 // Team34 (main controller) MAC — learned dynamically on first ESP-NOW receive
 static uint8_t mainMAC[6]  = {};
 static bool    mainMACKnown = false;
@@ -152,6 +154,8 @@ void     drawStopButton();
 void     updateBars();
 void     drawComplete();
 void     recalcCardH();
+void     drawHeader();     
+void     updateWeight(float w);                                  //added function
 uint16_t blendColor(uint16_t a, uint16_t b, float t);
 void     gradientFill(int x, int y, int w, int h, uint16_t topC, uint16_t botC);
 
@@ -274,12 +278,8 @@ void drawDispLayout() {
 
     tft.fillScreen(C_DARK_BG);
 
-    // Header gradient strip
-    gradientFill(0, 0, SCR_W, HDR_H, C_GRAD_TOP, C_GRAD_BOT);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(C_WHITE);
-    tft.setTextFont(4);   // 26 px built-in
-    tft.drawString("Dispensing...", SCR_W / 2, HDR_H / 2 + 1);
+    // Header 
+    drawHeader();
 
     // One card per active ingredient
     for (int i = 0; i < dispN; i++) {
@@ -321,6 +321,32 @@ void drawDispLayout() {
     drawStopButton();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Header with aligned weight indicator
+// ─────────────────────────────────────────────────────────────────────────────
+
+void drawHeader() {
+    // Only called once on layout init — draws the full header
+    gradientFill(0, 0, SCR_W, HDR_H, C_GRAD_TOP, C_GRAD_BOT);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextFont(4);
+    tft.setTextColor(C_WHITE);
+    tft.drawString("Dispensing...", MARGIN, HDR_H / 2 + 1);
+}
+
+void updateWeight(float w) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.1fml", w);
+
+    // Erase only the number area (right side of header)
+    gradientFill(SCR_W - 80, 0, 80, HDR_H, C_GRAD_TOP, C_GRAD_BOT);
+
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextFont(4);
+    tft.setTextColor(C_WHITE);
+    tft.drawString(buf, SCR_W - MARGIN, HDR_H / 2 + 1);
+    tft.setTextDatum(ML_DATUM);
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // On-screen FORCE STOP button — drawn at bottom of display during dispensing
 // ─────────────────────────────────────────────────────────────────────────────
@@ -518,6 +544,14 @@ void parseCmd(const char *s) {
             layoutDirtyAt = millis();
         }
         return;
+        
+    }
+    // ── WEIGHT:<grams> ───────────────────────────────────────────────────────────
+   if (strncmp(s, "WEIGHT:", 7) == 0) {
+    if (state != ST_DISPENSING) return;
+       updateWeight(atof(s + 7));
+    
+    return;
     }
 
     // ── COMPLETE ─────────────────────────────────────────────────────────────
